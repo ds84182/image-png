@@ -15,7 +15,7 @@ use common::{ColorType, BitDepth, Info, Unit, PixelDimensions, AnimationControl,
 use chunk::{self, ChunkType, IHDR, IDAT, IEND};
 
 /// TODO check if these size are reasonable
-pub const CHUNCK_BUFFER_SIZE: usize = 32*1024;
+pub const CHUNK_BUFFER_SIZE: usize = 32*1024;
 
 #[derive(Debug)]
 enum U32Value {
@@ -116,6 +116,20 @@ impl From<DecodingError> for io::Error {
     }
 }
 
+pub trait ImageDataSink {
+    fn add(&mut self, data: &[u8]);
+}
+
+impl ImageDataSink for Vec<u8> {
+    fn add(&mut self, data: &[u8]) {
+        self.extend_from_slice(data)
+    }
+}
+
+impl ImageDataSink for () {
+    fn add(&mut self, _: &[u8]) {}
+}
+
 /// PNG StreamingDecoder (low-level interface)
 pub struct StreamingDecoder {
     state: Option<State>,
@@ -133,7 +147,7 @@ impl StreamingDecoder {
     pub fn new() -> StreamingDecoder {
         StreamingDecoder {
             state: Some(State::Signature(0, [0; 7])),
-            current_chunk: (Crc32::new(), 0, Vec::with_capacity(CHUNCK_BUFFER_SIZE)),
+            current_chunk: (Crc32::new(), 0, Vec::with_capacity(CHUNK_BUFFER_SIZE)),
             inflater: if cfg!(fuzzing) {InflateStream::from_zlib_no_checksum()} else {InflateStream::from_zlib()},
             info: None,
             current_seq_no: None,
@@ -158,7 +172,7 @@ impl StreamingDecoder {
     /// Allows to stream partial data to the encoder. Returns a tuple containing the bytes that have
     /// been consumed from the input buffer and the current decoding result. If the decoded chunk
     /// was an image data chunk, it also appends the read data to `image_data`.
-    pub fn update(&mut self, mut buf: &[u8], image_data: &mut Vec<u8>)
+    pub fn update<S: ImageDataSink>(&mut self, mut buf: &[u8], image_data: &mut S)
     -> Result<(usize, Decoded), DecodingError> {
         let len = buf.len();
         while buf.len() > 0 && self.state.is_some() {
@@ -176,7 +190,7 @@ impl StreamingDecoder {
         Ok((len-buf.len(), Decoded::Nothing))
     }
 
-    fn next_state<'a>(&'a mut self, buf: &[u8], image_data: &mut Vec<u8>)
+    fn next_state<'a, S: ImageDataSink>(&'a mut self, buf: &[u8], image_data: &mut S)
     -> Result<(usize, Decoded), DecodingError> {
         use self::State::*;
 
@@ -342,7 +356,7 @@ impl StreamingDecoder {
             DecodeData(type_str, mut n) => {
                 let chunk_len = self.current_chunk.2.len();
                 let (c, data) = try!(self.inflater.update(&self.current_chunk.2[n..]));
-                image_data.extend_from_slice(data);
+                image_data.add(data);
                 n += c;
                 if n == chunk_len && data.len() == 0 && c == 0 {
                     goto!(

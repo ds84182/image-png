@@ -45,6 +45,7 @@
 #[macro_use] extern crate bitflags;
 
 extern crate num_iter;
+extern crate circbuf;
 
 pub mod chunk;
 mod crc;

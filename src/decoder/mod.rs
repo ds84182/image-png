@@ -1,7 +1,7 @@
 mod stream;
 
-pub use self::stream::{StreamingDecoder, Decoded, DecodingError};
-use self::stream::{CHUNCK_BUFFER_SIZE, get_info};
+pub use self::stream::{StreamingDecoder, ImageDataSink, Decoded, DecodingError};
+use self::stream::{CHUNK_BUFFER_SIZE, get_info};
 
 use std::mem;
 use std::borrow;
@@ -12,6 +12,8 @@ use common::{ColorType, BitDepth, Info, Transformations};
 use filter::{unfilter, FilterType};
 use chunk::IDAT;
 use utils;
+
+use circbuf::CircBuf;
 
 /*
 pub enum InterlaceHandling {
@@ -146,7 +148,7 @@ struct ReadDecoder<R: Read> {
 impl<R: Read> ReadDecoder<R> {
     /// Returns the next decoded chunk. If the chunk is an ImageData chunk, its contents are written
     /// into image_data.
-    fn decode_next(&mut self, image_data: &mut Vec<u8>) -> Result<Option<Decoded>, DecodingError> {
+    fn decode_next<S: ImageDataSink>(&mut self, image_data: &mut S) -> Result<Option<Decoded>, DecodingError> {
         while !self.at_eof {
             let (consumed, result) = {
                 let buf = try!(self.reader.fill_buf());
@@ -172,6 +174,13 @@ impl<R: Read> ReadDecoder<R> {
     }
 }
 
+impl ImageDataSink for circbuf::CircBuf {
+    fn add(&mut self, data: &[u8]) {
+        while self.avail() < data.len() { self.grow(); }
+        self.write(data).unwrap();
+    }
+}
+
 /// PNG reader (mostly high-level interface)
 ///
 /// Provides a high level that iterates over lines or whole images.
@@ -183,7 +192,8 @@ pub struct Reader<R: Read> {
     /// Previous raw line
     prev: Vec<u8>,
     /// Current raw line
-    current: Vec<u8>,
+    buffer: CircBuf,
+    buffer_linear: Vec<u8>,
     /// Output transformations
     transform: Transformations,
     /// Processed line
@@ -201,7 +211,7 @@ impl<R: Read> Reader<R> {
     fn new(r: R, d: StreamingDecoder, t: Transformations) -> Reader<R> {
         Reader {
             decoder: ReadDecoder {
-                reader: BufReader::with_capacity(CHUNCK_BUFFER_SIZE, r),
+                reader: BufReader::with_capacity(CHUNK_BUFFER_SIZE, r),
                 decoder: d,
                 at_eof: false
             },
@@ -209,7 +219,8 @@ impl<R: Read> Reader<R> {
             rowlen: 0,
             adam7: None,
             prev: Vec::new(),
-            current: Vec::new(),
+            buffer: CircBuf::new(),
+            buffer_linear: Vec::new(),
             transform: t,
             processed: Vec::new()
         }
@@ -222,7 +233,7 @@ impl<R: Read> Reader<R> {
             Ok(())
         } else {
             loop {
-                match try!(self.decoder.decode_next(&mut Vec::new())) {
+                match try!(self.decoder.decode_next(&mut ())) {
                     Some(ChunkBegin(_, IDAT)) => break,
                     None => return Err(DecodingError::Format(
                         "IDAT chunk missing".into()
@@ -432,15 +443,15 @@ impl<R: Read> Reader<R> {
 
     fn skip(&mut self, rowlen: usize) -> Result<bool, DecodingError> {
         loop {
-            if self.current.len() >= rowlen {
-                self.current.drain(0..rowlen);
+            if self.buffer.len() >= rowlen {
+                self.buffer.advance_read(rowlen);
                 break Ok(true)
             } else {
-                let val = try!(self.decoder.decode_next(&mut self.current));
+                let val = try!(self.decoder.decode_next(&mut self.buffer));
                 match val {
                     Some(Decoded::ImageData) => {}
                     None => {
-                        if self.current.len() > 0 {
+                        if self.buffer.len() > 0 {
                             break Err(DecodingError::Format(
                                 "file truncated".into()
                             ))
@@ -502,7 +513,7 @@ impl<R: Read> Reader<R> {
     }
 
     /// Returns the next raw row of the image
-    fn next_raw_interlaced_row(&mut self) -> Result<Option<(&[u8], Option<(u8, u32, u32)>)>, DecodingError> {
+    pub fn next_raw_interlaced_row(&mut self) -> Result<Option<(&[u8], Option<(u8, u32, u32)>)>, DecodingError> {
         let _ = get_info!(self);
         let bpp = self.bpp;
         let (rowlen, passdata) = if let Some(ref mut adam7) = self.adam7 {
@@ -520,15 +531,22 @@ impl<R: Read> Reader<R> {
             (self.rowlen, None)
         };
         loop {
-            if self.current.len() >= rowlen {
-                if let Some(filter) = FilterType::from_u8(self.current[0]) {
-                    if let Err(message) = unfilter(filter, bpp, &self.prev[1..rowlen], &mut self.current[1..rowlen]) {
+            if self.buffer.len() >= rowlen {
+                let filter_method = self.buffer.peek().unwrap();
+                if let Some(filter) = FilterType::from_u8(filter_method) {
+                    {
+                        self.buffer_linear.clear();
+                        let [a, b] = self.buffer.get_bytes_upto_size(rowlen);
+                        self.buffer_linear.extend_from_slice(a);
+                        self.buffer_linear.extend_from_slice(b);
+                    }
+                    if let Err(message) = unfilter(filter, bpp, &self.prev[1..rowlen], &mut self.buffer_linear[1..]) {
                         return Err(DecodingError::Format(
                             borrow::Cow::Borrowed(message)
                         ))
                     }
-                    self.prev[..rowlen].copy_from_slice(&self.current[..rowlen]);
-                    self.current.drain(0..rowlen);
+                    self.prev[..rowlen].copy_from_slice(&self.buffer_linear[..rowlen]);
+                    self.buffer.advance_read(rowlen);
                     return Ok(
                         Some((
                             &self.prev[1..rowlen],
@@ -537,15 +555,15 @@ impl<R: Read> Reader<R> {
                     )
                 } else {
                     return Err(DecodingError::Format(
-                        format!("invalid filter method ({})", self.current[0]).into()
+                        format!("invalid filter method ({})", filter_method).into()
                     ))
                 }
             } else {
-                let val = try!(self.decoder.decode_next(&mut self.current));
+                let val = try!(self.decoder.decode_next(&mut self.buffer));
                 match val {
                     Some(Decoded::ImageData) => {}
                     None => {
-                        if self.current.len() > 0 {
+                        if self.buffer.len() > 0 {
                             return Err(DecodingError::Format(
                               "file truncated".into()
                             ))
