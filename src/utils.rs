@@ -135,6 +135,11 @@ impl Adam7Iterator {
     pub fn current_pass(&self) -> u8 {
         self.current_pass
     }
+
+    /// The width of the lines in the current pass, in pixels.
+    pub fn line_width(&self) -> u32 {
+        self.line_width
+    }
 }
 
 /// Iterates over the (passes, lines, widths)

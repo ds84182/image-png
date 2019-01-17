@@ -430,6 +430,77 @@ impl<R: Read> Reader<R> {
         self.processed = vec![0; self.line_size(width)]
     }
 
+    fn skip(&mut self, rowlen: usize) -> Result<bool, DecodingError> {
+        loop {
+            if self.current.len() >= rowlen {
+                self.current.drain(0..rowlen);
+                break Ok(true)
+            } else {
+                let val = try!(self.decoder.decode_next(&mut self.current));
+                match val {
+                    Some(Decoded::ImageData) => {}
+                    None => {
+                        if self.current.len() > 0 {
+                            break Err(DecodingError::Format(
+                                "file truncated".into()
+                            ))
+                        } else {
+                            break Ok(false)
+                        }
+                    }
+                    _ => ()
+                }
+            }
+        }
+    }
+
+    pub fn skip_rows(&mut self, mut count: u32) -> Result<u32, DecodingError> {
+        if count == 0 { return Ok(0) }
+
+        let start_count = count;
+
+        let _ = get_info!(self);
+        if self.adam7.is_some() {
+            let last_pass = self.adam7.as_mut().unwrap().current_pass();
+            'outer: while let Some((_, line, len)) = self.adam7.as_mut().unwrap().next() {
+                let rowlen = get_info!(self).raw_row_length_from_width(len);
+                for i in line..len {
+                    if i != line {
+                        self.adam7.as_mut().unwrap().next();
+                    }
+
+                    if try!(self.skip(rowlen)) {
+                        count -= 1;
+                    } else {
+                        break 'outer
+                    }
+
+                    if count <= 0 {
+                        break 'outer;
+                    }
+                }
+            }
+
+            let adam7 = self.adam7.as_mut().unwrap();
+            if last_pass != adam7.current_pass() {
+                let rowlen = get_info!(self).raw_row_length_from_width(adam7.line_width());
+
+                self.prev.resize(rowlen, 0);
+            }
+        } else {
+            let rowlen = self.rowlen;
+            while count > 0 {
+                if try!(self.skip(rowlen)) {
+                    count -= 1;
+                } else {
+                    break
+                }
+            }
+        }
+
+        return Ok(start_count - count)
+    }
+
     /// Returns the next raw row of the image
     fn next_raw_interlaced_row(&mut self) -> Result<Option<(&[u8], Option<(u8, u32, u32)>)>, DecodingError> {
         let _ = get_info!(self);
@@ -439,10 +510,7 @@ impl<R: Read> Reader<R> {
             if let Some((pass, line, len)) = adam7.next() {
                 let rowlen = get_info!(self).raw_row_length_from_width(len);
                 if last_pass != pass {
-                    self.prev.clear();
-                    for _ in 0..rowlen {
-                        self.prev.push(0);
-                    }
+                    self.prev.resize(rowlen, 0);
                 }
                 (rowlen, Some((pass, line, len)))
             } else {
